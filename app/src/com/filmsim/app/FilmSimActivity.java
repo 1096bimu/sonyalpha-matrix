@@ -5,9 +5,6 @@ import android.app.DAConnectionManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.Matrix;
 import android.hardware.Camera;
 import android.os.Build;
 import android.os.Bundle;
@@ -19,7 +16,6 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.ImageView;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
 
@@ -55,9 +51,9 @@ import java.util.Set;
  * so the viewfinder, JPEGs and anything else the ISP renders carry the look.
  *
  * Controls (A7 II): rear dial = shutter (S/M) or exposure comp (P/A), front dial = ISO,
- * control wheel = film, Fn = menu (brand, film, strength, white balance, Kelvin, halation, grain, light leak:
- * up/down picks a row, left/right or the wheel changes it, C2 marks a favourite), centre = focus magnifier, C1 = compare with no look,
- * C2 = strength (favourite while in the menu), C3 = white balance, DISP/up = info on/off, Play = review photos, MOVIE = record video, MENU = exit.
+ * control wheel = film, Fn = menu (matrix, strength, white balance:
+ * up/down picks a row, left/right or the wheel changes it, C2 changes strength), centre = focus magnifier, C1 = compare with no look,
+ * C2 = strength, C3 = white balance, DISP/up = info on/off, Play = review photos, MOVIE = record video, MENU = exit.
  */
 public class FilmSimActivity extends Activity implements SurfaceHolder.Callback, CameraEx.ShutterListener {
     private static final int[] IDENTITY = {1024, 0, 0, 0, 1024, 0, 0, 0, 1024};
@@ -78,7 +74,11 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
 
     private CameraEx camera;
     private boolean takingPicture;
-    private boolean pausing;
+    private FocusOverlay focusOverlay;
+    private volatile int lastAfStatus;
+    private java.util.List<android.graphics.Rect> sonyFocusAreas = new java.util.ArrayList<android.graphics.Rect>();
+    private volatile boolean pausing;
+    private volatile Thread shutdownThread;
 
     // Look state
     private FilmLibrary.Film film;
@@ -88,35 +88,22 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     private boolean overlay = true;
 
     // Fn menu: one row per setting
-    private static final String[] MENU_ROWS = {"Brand", "Film", "Strength", "WB", "Kelvin", "D-Range", "Halation", "Grain",
-            "Light leak", "Copy size"};
-    private static final int ROW_BRAND = 0, ROW_FILM = 1, ROW_STRENGTH = 2, ROW_WB = 3, ROW_KELVIN = 4, ROW_DRO = 5,
-            ROW_HALATION = 6, ROW_GRAIN = 7, ROW_LEAK = 8, ROW_SIZE = 9;
-    private static final String[] GRAIN_NAMES = {"Off", "Fine", "Medium", "Heavy", "Coarse"};
-    private static final String FAVOURITES = "Favourites";
+    private static final String[] MENU_ROWS = {"Matrix", "Strength", "WB", "D-Range"};
+    private static final int ROW_FILM = 0, ROW_STRENGTH = 1, ROW_WB = 2, ROW_DRO = 3;
     private boolean menuOpen;
     private int menuRow = ROW_FILM;
-    private final Set<String> favourites = new LinkedHashSet<String>();
-    // After-shot develop effects; any of them makes a developed copy in FILMSIM/DEV
-    private boolean halation;
-    private int grain;
-    private boolean lightLeak;
-    private boolean largeCopy;
     // Sony's D-Range Optimizer: 0 off, 1 auto, 2.. level 1..maxDro
     private int dro;
     private int maxDro = 5;
     private List<String> droModes = new ArrayList<String>();
 
     // White balance panel
-    private static final String[] WB_ORDER = {"auto", "daylight", "shade", "cloudy-daylight", "incandescent",
-            "warm-fluorescent", "fluorescent-coolwhite", "fluorescent-daywhite", "fluorescent-daylight", "flash", "color-temp"};
     private static final String WB_KELVIN = "color-temp";
-    private final List<String> wbModes = new ArrayList<String>();
+
     private String wbMode = "auto";
     private int kelvin = 5500, minKelvin = 2500, maxKelvin = 9900;
     private String savedWb;
     private int savedKelvin;
-    private int menuBrand;
     private int menuFilm;
 
     // Exposure state
@@ -144,13 +131,6 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     private int playIndex;
     private OptimizedImage playImage;
     private Map<String, String> shotFilms = new HashMap<String, String>();
-    /** Shows the developed copy (halation, grain, leaks) over the original when one exists. */
-    private ImageView devView;
-    private Bitmap devBitmap;
-    private boolean showDeveloped = true;
-    /** The developed copy decoded by Sony's viewer, which shows full colour (the app's overlay is 16 levels per colour). */
-    private OptimizedImage devImage;
-
     // Video: the camera is reopened in movie mode for recording, then back in photo mode afterwards.
     private MediaRecorder recorder;
     private boolean movieMode;
@@ -159,17 +139,10 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     private boolean startWhenReady;
     private int recTime = -1;
 
-    // Developed copies, made in the background after each shot
-    private Developer developer;
-    private int developing;
-    private FilmLibrary.Film shotFilm;
     /** Newest files before the next shot. The camera's clock can't be trusted (it reads 1970), so new files are
      * the ones that weren't there before. */
-    private File knownPhoto, knownJpeg;
+    private File knownPhoto;
     /** The saved film when it's one of the user's LUTs, which only exist once they've been loaded. */
-    private String pendingFilmKey;
-    private Thread customLoader;
-    private long exitConfirmUntil;
 
     private FileWriter log;
 
@@ -189,76 +162,72 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         keyInfo = (TextView) findViewById(R.id.keyInfo);
         root = (RelativeLayout) findViewById(R.id.root);
         playInfo = (TextView) findViewById(R.id.playInfo);
-        developer = new Developer(new File(new File(Environment.getExternalStorageDirectory(), "FILMSIM"), "DEV"),
-                new Developer.Listener() {
-                    public boolean cameraBusy() {
-                        return takingPicture || recording || writingVideo;
-                    }
-
-                    public void onStatus(final int queued) {
-                        runOnUiThread(new Runnable() {
-                            public void run() {
-                                developing = queued;
-                                refreshFilmBar();
-                            }
-                        });
-                    }
-
-                    public void onDone(final String source, final File result, final long millis) {
-                        runOnUiThread(new Runnable() {
-                            public void run() {
-                                log("developed " + source + " -> " + result.getName() + " in " + millis + " ms: " + developer.lastTiming + " (" + developer.memNote + ")");
-                                showMessage("Developed copy saved: " + result.getName() + " (" + (millis / 1000) + " s)");
-                            }
-                        });
-                    }
-
-                    public void onFailed(final String source, final Throwable error) {
-                        runOnUiThread(new Runnable() {
-                            public void run() {
-                                log("develop " + source + " failed: " + error);
-                                showMessage("Developing failed: " + error.getMessage());
-                            }
-                        });
-                    }
-                });
-        try {
-            library = new FilmLibrary(getAssets());
-        } catch (IOException e) {
-            message.setText("Could not load films: " + e);
-        }
+        focusOverlay = new FocusOverlay(this);
+        root.addView(focusOverlay, 1, new RelativeLayout.LayoutParams(-1, -1));
+        library = new FilmLibrary(getAssets(), new File(Environment.getExternalStorageDirectory(), "MATRIX"));
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         pausing = false;
+        resumeAfterShutdown();
+    }
+
+    private void resumeAfterShutdown() {
+        if (pausing || isFinishing()) return;
+        Thread shutdown = shutdownThread;
+        if (shutdown != null && shutdown.isAlive()) {
+            handler.postDelayed(new Runnable() {
+                public void run() { resumeAfterShutdown(); }
+            }, 100);
+            return;
+        }
         openLog();
+        if (library != null) for (String entry : library.scanLog) log("Matrix scan: " + entry);
         notifyAppInfo();
+        if (library == null) return;
         restorePrefs();
         File dcim = new File(Environment.getExternalStorageDirectory(), "DCIM");
         knownPhoto = newestPhoto(dcim);
-        knownJpeg = newestJpeg(dcim);
         if (!openCamera()) return;
         readCapabilities();
         startShooting();
-        loadCustomLuts();
+        log("Matrix folder=" + new File(Environment.getExternalStorageDirectory(), "MATRIX")
+                + " entries=" + library.all().size() + " error=" + library.storageError);
+        if (library.storageError != null) {
+            message.setText("Matrix folder unavailable. No Change is available.\n" + library.storageError);
+            message.setVisibility(View.VISIBLE);
+            log("startup storage error: " + library.storageError);
+        }
     }
 
     @Override
     protected void onPause() {
-        super.onPause();
         pausing = true;
-        developer.cancel();
+        focusOverlay.state(0);
         handler.removeCallbacksAndMessages(null);
         savePrefs();
         closePlayback(false);
-        closeCamera();
-        movieMode = false;
-        writingVideo = false;
-        takingPicture = false;
-        log("exit");
-        closeLog();
+        final boolean exitAfter = isFinishing();
+        Thread shutdown = new Thread(new Runnable() {
+            public void run() {
+                try {
+                    log("shutdown begin");
+                    closeCamera();
+                    movieMode = false;
+                    writingVideo = false;
+                    takingPicture = false;
+                    log("shutdown complete");
+                } finally {
+                    closeLog();
+                    if (exitAfter) android.os.Process.killProcess(android.os.Process.myPid());
+                }
+            }
+        }, "matrix-camera-shutdown");
+        shutdownThread = shutdown;
+        shutdown.start();
+        super.onPause();
     }
 
     /** Settings that have to be (re)applied every time the camera is opened. */
@@ -283,6 +252,9 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
                 camera = CameraEx.open(0, null);
             }
             camera.setShutterListener(this);
+            sonyFocusAreas.clear();
+            focusOverlay.areas(sonyFocusAreas);
+            installFocusListeners(camera);
             camera.setShutterSpeedChangeListener(new CameraEx.ShutterSpeedChangeListener() {
                 public void onShutterSpeedChange(final CameraEx.ShutterSpeedInfo info, CameraEx c) {
                     runOnUiThread(new Runnable() {
@@ -317,6 +289,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         } catch (Throwable t) {
             log("CameraEx.open failed: " + t);
             message.setText("Camera open failed: " + t);
+            message.setVisibility(View.VISIBLE);
             camera = null;
             return false;
         }
@@ -489,7 +462,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         }, 500);
     }
 
-    /** Undoes the look and hands the camera back (on exit, and while reviewing photos, like Sony's apps). */
+    /** Undoes the look and hands the camera back on exit and during playback. */
     private void closeCamera() {
         if (camera == null) return;
         handler.removeCallbacks(poll);
@@ -497,14 +470,19 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         startWhenReady = false;
         releaseRecorder();
         stopMagnifier();
+        log("shutdown reset color begin");
         clearLook();
+        log("shutdown reset color done; stopPreview begin");
         try {
             camera.getNormalCamera().stopPreview();
+            log("shutdown stopPreview done");
         } catch (Throwable t) {
             log("stopPreview failed: " + t);
         }
         try {
+            log("shutdown release begin");
             camera.release();
+            log("shutdown release done");
         } catch (Throwable t) {
             log("release failed: " + t);
         }
@@ -550,11 +528,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
             } catch (Throwable t) {
                 log("dro capabilities failed: " + t);
             }
-            wbModes.clear();
             List<String> wb = sup.getSupportedWhiteBalance();
-            for (String mode : WB_ORDER) {
-                if (wb == null || wb.contains(mode)) wbModes.add(mode);
-            }
             try {
                 minKelvin = m.getMinColorTemperatureForWhiteBalance();
                 maxKelvin = m.getMaxColorTemperatureForWhiteBalance();
@@ -653,7 +627,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         }
     }
 
-    /** Next/previous film across the whole library (brand order), used by the control wheel. */
+    /** Next/previous film across the whole library (filename order), used by the control wheel. */
     private void stepFilm(int dir) {
         List<FilmLibrary.Film> all = library.all();
         if (all.isEmpty()) return;
@@ -673,37 +647,10 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
 
     // ---------------- picker ----------------
 
-    private static String favKey(FilmLibrary.Film f) {
-        return f.brand + "|" + f.name;
-    }
-
-    private boolean isFavourite(FilmLibrary.Film f) {
-        return f != null && favourites.contains(favKey(f));
-    }
-
-    /** Brands in menu order; "Favourites" comes first once anything is marked. */
-    private List<String> menuBrands() {
-        List<String> out = new ArrayList<String>();
-        if (!favourites.isEmpty()) out.add(FAVOURITES);
-        out.addAll(library.brands());
-        return out;
-    }
-
-    private List<FilmLibrary.Film> menuFilms(String brand) {
-        if (!FAVOURITES.equals(brand)) return library.byBrand(brand);
-        List<FilmLibrary.Film> out = new ArrayList<FilmLibrary.Film>();
-        for (FilmLibrary.Film f : library.all()) {
-            if (isFavourite(f)) out.add(f);
-        }
-        return out;
-    }
-
     private void openMenu(int row) {
         menuOpen = true;
         menuRow = row;
-        List<String> brands = menuBrands();
-        menuBrand = film != null ? Math.max(0, brands.indexOf(film.brand)) : 0;
-        List<FilmLibrary.Film> list = menuFilms(brands.get(menuBrand));
+        List<FilmLibrary.Film> list = library.all();
         menuFilm = film != null ? Math.max(0, list.indexOf(film)) : 0;
         refreshMenu();
     }
@@ -720,15 +667,9 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
 
     /** Left/right or the wheel: change the value on the highlighted row. */
     private void menuChange(int dir) {
-        List<String> brands = menuBrands();
         switch (menuRow) {
-            case ROW_BRAND:
-                menuBrand = (menuBrand + dir + brands.size()) % brands.size();
-                menuFilm = 0;
-                scheduleMenuFilm();
-                break;
             case ROW_FILM: {
-                List<FilmLibrary.Film> list = menuFilms(brands.get(Math.min(menuBrand, brands.size() - 1)));
+                List<FilmLibrary.Film> list = library.all();
                 if (!list.isEmpty()) {
                     menuFilm = (menuFilm + dir + list.size()) % list.size();
                     scheduleMenuFilm();
@@ -741,14 +682,9 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
                 refreshFilmBar();
                 break;
             case ROW_WB:
-                if (!wbModes.isEmpty()) {
-                    int i = Math.max(0, wbModes.indexOf(wbMode));
-                    i = (i + dir + wbModes.size()) % wbModes.size();
-                    setWhiteBalance(wbModes.get(i), kelvin, true);
-                }
-                break;
-            case ROW_KELVIN:
-                if (wbModes.contains(WB_KELVIN)) setWhiteBalance(WB_KELVIN, kelvin + dir * 100, true);
+                int current = "auto".equals(wbMode) ? 2 : kelvin == 3200 ? 1 : 0;
+                int next = (current + dir + 3) % 3;
+                setWhiteBalance(next == 2 ? "auto" : WB_KELVIN, next == 1 ? 3200 : 5500, true);
                 break;
             case ROW_DRO:
                 if (!droModes.isEmpty()) {
@@ -757,103 +693,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
                     applyDro();
                 }
                 break;
-            case ROW_HALATION:
-                halation = !halation;
-                developHint();
-                break;
-            case ROW_GRAIN:
-                grain = (grain + dir + GRAIN_NAMES.length) % GRAIN_NAMES.length;
-                developHint();
-                break;
-            case ROW_LEAK:
-                lightLeak = !lightLeak;
-                developHint();
-                break;
-            case ROW_SIZE:
-                largeCopy = !largeCopy;
-                showMessage(largeCopy ? "Large copies: 3000 px wide, slow (1-2 min each)" : "Small copies: 1500 px wide, much faster");
-                break;
         }
-        refreshMenu();
-    }
-
-    /** Reads the user's own LUTs from the LUTS folder, converting new ones in the background. */
-    private void loadCustomLuts() {
-        if (customLoader != null && customLoader.isAlive()) return;
-        final File card = Environment.getExternalStorageDirectory();
-        customLoader = new Thread(new Runnable() {
-            public void run() {
-                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
-                final List<FilmLibrary.Film> custom = new CustomLuts(card).load(new CustomLuts.Listener() {
-                    public void onConverting(final int index, final int total, final String name) {
-                        runOnUiThread(new Runnable() {
-                            public void run() {
-                                showMessage("Converting your LUT " + index + "/" + total + ": " + name);
-                            }
-                        });
-                    }
-
-                    public void onFailed(final String name, final String reason) {
-                        runOnUiThread(new Runnable() {
-                            public void run() {
-                                log("custom LUT " + name + " failed: " + reason);
-                                showMessage("Couldn't use LUT " + name + ": " + reason);
-                            }
-                        });
-                    }
-                });
-                runOnUiThread(new Runnable() {
-                    public void run() {
-                        if (pausing) return;
-                        library.setCustom(custom);
-                        if (!custom.isEmpty()) log("loaded " + custom.size() + " custom LUTs");
-                        if (pendingFilmKey != null) {
-                            FilmLibrary.Film f = library.find(pendingFilmKey);
-                            pendingFilmKey = null;
-                            if (f != null) selectFilm(f);
-                        }
-                        refreshMenu();
-                        refreshFilmBar();
-                    }
-                });
-            }
-        }, "custom-luts");
-        customLoader.start();
-    }
-
-    private boolean developOn() {
-        return halation || grain > 0 || lightLeak;
-    }
-
-    private void developHint() {
-        if (developOn()) showMessage("After each shot a developed copy goes to FILMSIM/DEV");
-        refreshFilmBar();
-    }
-
-    /** C2 in the menu: add or remove the highlighted film from Favourites. */
-    private void toggleFavourite() {
-        List<String> brands = menuBrands();
-        String brand = brands.get(Math.min(menuBrand, brands.size() - 1));
-        List<FilmLibrary.Film> list = menuFilms(brand);
-        if (list.isEmpty()) return;
-        FilmLibrary.Film f = list.get(Math.min(menuFilm, list.size() - 1));
-        boolean wasEmpty = favourites.isEmpty();
-        if (!favourites.remove(favKey(f))) favourites.add(favKey(f));
-        showMessage(isFavourite(f) ? f.name + " added to Favourites" : f.name + " removed from Favourites");
-        // keep the same brand and film highlighted as the Favourites entry appears or disappears
-        List<String> now = menuBrands();
-        menuBrand = Math.max(0, now.indexOf(brand));
-        if (FAVOURITES.equals(brand)) {
-            if (favourites.isEmpty()) {
-                menuBrand = Math.max(0, now.indexOf(f.brand));
-                menuFilm = Math.max(0, library.byBrand(f.brand).indexOf(f));
-            } else {
-                menuFilm = Math.min(menuFilm, menuFilms(FAVOURITES).size() - 1);
-            }
-        } else if (wasEmpty != favourites.isEmpty()) {
-            menuBrand = Math.max(0, now.indexOf(brand));
-        }
-        savePrefs();
         refreshMenu();
     }
 
@@ -866,8 +706,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     private final Runnable menuApply = new Runnable() {
         public void run() {
             if (!menuOpen) return;
-            List<String> brands = menuBrands();
-            List<FilmLibrary.Film> list = menuFilms(brands.get(Math.min(menuBrand, brands.size() - 1)));
+                List<FilmLibrary.Film> list = library.all();
             if (menuFilm < list.size()) selectFilm(list.get(menuFilm));
         }
     };
@@ -876,29 +715,20 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         if (!menuOpen && pickerPanel.getVisibility() != View.GONE) repaintSoon();
         pickerPanel.setVisibility(menuOpen ? View.VISIBLE : View.GONE);
         if (!menuOpen) return;
-        List<String> brands = menuBrands();
-        menuBrand = Math.min(menuBrand, brands.size() - 1);
-        String brand = brands.get(menuBrand);
-        List<FilmLibrary.Film> list = menuFilms(brand);
+        List<FilmLibrary.Film> list = library.all();
         String filmValue;
         if (list.isEmpty()) {
             filmValue = "-";
         } else {
             FilmLibrary.Film cur = list.get(Math.min(menuFilm, list.size() - 1));
-            filmValue = cur.name + "  " + stars(cur) + (isFavourite(cur) ? " \u2665" : "")
+            filmValue = cur.name
                     + "   (" + (Math.min(menuFilm, list.size() - 1) + 1) + "/" + list.size() + ")";
         }
         String[] values = {
-            brand + "   (" + (menuBrand + 1) + "/" + brands.size() + ")",
             filmValue,
             strength + "%",
-            wbModes.isEmpty() ? "n/a" : wbLabel(wbMode, kelvin),
-            kelvin + "K" + (WB_KELVIN.equals(wbMode) ? "" : "  (sets WB)"),
+            wbLabel(wbMode, kelvin),
             droLabel(),
-            halation ? "On" : "Off",
-            GRAIN_NAMES[grain],
-            lightLeak ? "On  (random each shot)" : "Off",
-            largeCopy ? "Large  (3000 px, slow)" : "Small  (1500 px, fast)",
         };
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < MENU_ROWS.length; i++) {
@@ -908,16 +738,10 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
             sb.append(i == menuRow ? "<  " + values[i] + "  >" : "   " + values[i]).append('\n');
         }
         sb.append("\nup/down: row   left/right: change   Fn: close");
-        if (menuRow == ROW_FILM) sb.append("\nC2: favourite   Delete: no film");
-        if (menuRow >= ROW_HALATION) sb.append("\nAdded after the shot to a copy in FILMSIM/DEV (needs JPEG)");
+        if (menuRow == ROW_FILM) sb.append("\nC2: strength   Delete: no change");
         picker.setText(sb.toString());
     }
 
-    private static String stars(FilmLibrary.Film f) {
-        if (f.designed()) return "\u25c6";
-        int s = f.stars();
-        return s == 3 ? "★★★" : s == 2 ? "★★☆" : "★☆☆";
-    }
 
     // ---------------- white balance ----------------
 
@@ -971,18 +795,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     }
 
     private static String wbLabel(String mode, int k) {
-        if ("auto".equals(mode)) return "AWB";
-        if ("daylight".equals(mode)) return "Daylight";
-        if ("shade".equals(mode)) return "Shade";
-        if ("cloudy-daylight".equals(mode)) return "Cloudy";
-        if ("incandescent".equals(mode)) return "Tungsten";
-        if ("warm-fluorescent".equals(mode)) return "Fluor. warm";
-        if ("fluorescent-coolwhite".equals(mode)) return "Fluor. cool";
-        if ("fluorescent-daywhite".equals(mode)) return "Fluor. day white";
-        if ("fluorescent-daylight".equals(mode)) return "Fluor. daylight";
-        if ("flash".equals(mode)) return "Flash";
-        if (WB_KELVIN.equals(mode)) return k + "K";
-        return mode;
+        return "auto".equals(mode) ? "AWB" : k + "K";
     }
 
     // ---------------- exposure ----------------
@@ -1124,6 +937,67 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         }
     };
 
+    private void refreshFocusAreas() {
+        if (camera == null || pausing) return;
+        try {
+            Camera.Parameters params = camera.getNormalCamera().getParameters();
+            java.util.List<?> raw = (java.util.List<?>) params.getClass().getMethod("getFocusAreas").invoke(params);
+            java.util.List<android.graphics.Rect> areas = new java.util.ArrayList<android.graphics.Rect>();
+            if (raw != null) for (Object area : raw) {
+                android.graphics.Rect rect = (android.graphics.Rect) area.getClass().getField("rect").get(area);
+                if (rect != null) areas.add(new android.graphics.Rect(rect));
+            }
+            focusOverlay.areas(areas.isEmpty() ? sonyFocusAreas : areas);
+            log("AF selected Android areas=" + (areas == null ? "none" : areas.size()));
+        } catch (Throwable t) { focusOverlay.areas(sonyFocusAreas); log("AF selected areas unavailable: " + t); }
+    }
+
+    private void installFocusListeners(final CameraEx source) {
+        try {
+            source.setAutoFocusStartListener(new CameraEx.AutoFocusStartListener() {
+                public void onStart(CameraEx c) {
+                    log("AF start");
+                    handler.post(new Runnable() { public void run() {
+                        if (!pausing && camera == source) { refreshFocusAreas(); focusOverlay.state(3); }
+                    }});
+                }
+            });
+            source.setAutoFocusDoneListener(new CameraEx.AutoFocusDoneListener() {
+                public void onDone(final int status, int[] areas, CameraEx c) {
+                    lastAfStatus = status;
+                    log("AF done status=" + status + " areaIds=" + java.util.Arrays.toString(areas));
+                    handler.post(new Runnable() { public void run() {
+                        if (!pausing && camera == source) focusOverlay.state(
+                            status == 1 || status == 2 ? 1 : status == 3 || status == 4 ? 3 : 0);
+                    }});
+                }
+            });
+        } catch (Throwable t) { log("AF state listeners unavailable: " + t); }
+        try {
+            source.setFocusAreaListener(new CameraEx.FocusAreaListener() {
+                public void onChanged(CameraEx.FocusAreaInfos info, CameraEx c) {
+                    if (info == null) return;
+                    final java.util.List<android.graphics.Rect> rects = new java.util.ArrayList<android.graphics.Rect>();
+                    log("Sony AF area mode=" + info.focusAreaMode);
+                    if (info.rectInfos != null) for (CameraEx.FocusAreaRectInfo area : info.rectInfos) {
+                        if (area == null) continue;
+                        log("Sony AF rect index=" + area.index + " enabled=" + area.enable + " rect=" + area.rect);
+                        android.graphics.Rect rect = area.rect;
+                        if (area.enable && rect != null && rect.width() > 0 && rect.height() > 0
+                                && rect.left >= -1000 && rect.top >= -1000 && rect.right <= 1000 && rect.bottom <= 1000)
+                            rects.add(new android.graphics.Rect(rect));
+                    }
+                    handler.post(new Runnable() { public void run() {
+                        if (!pausing && camera == source) {
+                            sonyFocusAreas = rects;
+                            refreshFocusAreas();
+                        }
+                    }});
+                }
+            });
+        } catch (Throwable t) { log("Sony AF area listener unavailable: " + t); }
+    }
+
     // ---------------- focus magnifier ----------------
 
     private void cycleMagnifier() {
@@ -1185,8 +1059,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         } catch (Throwable t) {
             log("cancelTakePicture failed: " + t);
         }
-        final String label = film == null || bypass ? "No film" : film.brand + " " + film.name + " " + strength + "%";
-        shotFilm = bypass ? null : film;
+        final String label = film == null || bypass ? "No film" : film.name + " " + strength + "%";
         final long shotTime = System.currentTimeMillis();
         runOnUiThread(new Runnable() {
             public void run() {
@@ -1228,38 +1101,6 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         } catch (IOException e) {
             log("shot log failed: " + e);
         }
-        if (!developOn()) knownJpeg = newestJpeg(dcim);
-        if (developOn()) {
-            File jpeg = newestJpeg(dcim);
-            boolean fresh = jpeg != null && !jpeg.equals(knownJpeg);
-            knownJpeg = jpeg;
-            if (fresh) {
-                Develop.Options opt = new Develop.Options();
-                opt.halation = halation;
-                opt.grain = grain;
-                opt.lightLeak = lightLeak;
-                opt.sample = largeCopy ? 2 : 4;
-                opt.monochrome = shotFilm != null && "Black & white".equals(shotFilm.type);
-                opt.seed = jpeg.getName().hashCode() * 31L + shotTime;
-                developer.add(jpeg, opt);
-            } else {
-                showMessage("Developing needs JPEG: set Quality to RAW & JPEG");
-            }
-        }
-    }
-
-    private static File newestJpeg(File dcim) {
-        File best = null;
-        File[] dirs = dcim.listFiles();
-        if (dirs == null) return null;
-        for (File d : dirs) {
-            File[] files = d.listFiles();
-            if (files == null) continue;
-            for (File f : files) {
-                if (f.getName().toUpperCase().endsWith(".JPG") && (best == null || f.lastModified() > best.lastModified())) best = f;
-            }
-        }
-        return best;
     }
 
     private static File newestPhoto(File dcim) {
@@ -1304,6 +1145,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
             return;
         }
         closeMenu();
+        focusOverlay.state(0);
         closeCamera();
         shotFilms = readShotLog();
         playback = true;
@@ -1315,12 +1157,6 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         playView = new OptimizedImageView(this);
         // just above the live view surface, below the info line
         root.addView(playView, 1, new RelativeLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        devView = new ImageView(this);
-        devView.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        devView.setBackgroundColor(0xFF000000);
-        devView.setVisibility(View.GONE);
-        root.addView(devView, 2, new RelativeLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         playInfo.setVisibility(View.VISIBLE);
         showPhoto();
@@ -1337,13 +1173,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         }
         releasePlayImage();
         repaintSoon();
-        if (devView != null) {
-            devView.setImageBitmap(null);
-            root.removeView(devView);
-            devView = null;
-        }
-        releaseDevBitmap();
-        releaseDevImage();
+
         setOverlayColour(false);
         if (playView != null) {
             root.removeView(playView);
@@ -1359,29 +1189,12 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         if (reopen && openCamera()) startShooting();
     }
 
-    private void releaseDevImage() {
-        if (devImage != null) {
-            try {
-                devImage.release();
-            } catch (Throwable ignored) {
-            }
-            devImage = null;
-        }
-    }
-
     /** Full colour (8 bits per channel) or the camera's usual 4-bit overlay. */
     private void setOverlayColour(boolean full) {
         try {
             Gpelibrary.changeFrameBufferPixel(full ? Gpelibrary.GS_FRAMEBUFFER_TYPE.ABGR8888 : Gpelibrary.GS_FRAMEBUFFER_TYPE.RGBA4444);
         } catch (Throwable t) {
             log("overlay colour change failed: " + t);
-        }
-    }
-
-    private void releaseDevBitmap() {
-        if (devBitmap != null) {
-            devBitmap.recycle();
-            devBitmap = null;
         }
     }
 
@@ -1418,10 +1231,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
             case ScalarInput.ISV_KEY_S2:
                 closePlayback(true);
                 return true;
-            case ScalarInput.ISV_KEY_CUSTOM1:
-                showDeveloped = !showDeveloped;
-                showPhoto();
-                return true;
+
         }
         return true;
     }
@@ -1473,98 +1283,9 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         }
         if (name == null || name.length() == 0) name = new File(data).getName();
         String filmUsed = shotFilms.get(name.toUpperCase());
-        File dev = new File(new File(new File(Environment.getExternalStorageDirectory(), "FILMSIM"), "DEV"),
-                Developer.outName(name) + ".JPG");
-        boolean hasDev = dev.isFile();
-        if (!hasDev || !showDeveloped) {
-            devView.setImageBitmap(null);
-            releaseDevBitmap();
-            devView.setVisibility(View.GONE);
-        }
-        boolean devShown = false;
-        String via = "";
-        releaseDevImage();
-        if (hasDev && showDeveloped) {
-            // Sony's viewer shows full colour; try it first
-            try {
-                OptimizedImageFactory.Options o = new OptimizedImageFactory.Options();
-                o.imageType = 3;
-                devImage = OptimizedImageFactory.decodeImage(dev.getAbsolutePath(), o);
-            } catch (Throwable t) {
-                log("viewer decode of copy failed: " + t);
-                devImage = null;
-            }
-            if (devImage != null) {
-                devView.setImageBitmap(null);
-                releaseDevBitmap();
-                devView.setVisibility(View.GONE);
-                playView.setVisibility(View.VISIBLE);
-                try {
-                    playView.setOptimizedImage(devImage);
-                    devShown = true;
-                    via = "viewer";
-                } catch (Throwable t) {
-                    log("viewer show of copy failed: " + t);
-                    releaseDevImage();
-                }
-            }
-            if (!devShown && showDevCopy(dev, orientation)) {
-                // Sony's viewer draws on its own layer above the app's views, so hide it under the overlay copy
-                playView.setVisibility(View.INVISIBLE);
-                devShown = true;
-                via = "overlay";
-            }
-        }
-        if (!devShown) {
-            playView.setVisibility(View.VISIBLE);
-            if (img != null) {
-                try {
-                    playView.setOptimizedImage(img);
-                } catch (Throwable t) {
-                    log("re-show original failed: " + t);
-                }
-            }
-        }
-        log("playback " + name + " | copy " + dev.getName() + " exists " + hasDev + " shown " + devShown + " " + via);
-        String devLabel = !hasDev ? "" : devShown ? "DEVELOPED (C1: original)   " : "ORIGINAL (C1: developed)   ";
-        playInfo.setText(devLabel + name + "   " + (filmUsed != null ? filmUsed + "   " : "") + info
+        playInfo.setText(name + "   " + (filmUsed != null ? filmUsed + "   " : "") + info
                 + (playIndex + 1) + "/" + playFiles.size() + "      < > browse   Play: back");
-        if (img == null && !devShown) playInfo.append("\n(could not show this file)");
-    }
-
-    /** Decodes the developed copy at screen size and shows it over the original. */
-    private boolean showDevCopy(File dev, int orientation) {
-        devView.setImageBitmap(null);
-        releaseDevBitmap();
-        try {
-            BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inJustDecodeBounds = true;
-            BitmapFactory.decodeFile(dev.getPath(), o);
-            o.inJustDecodeBounds = false;
-            o.inSampleSize = 1;
-            while (o.outWidth / (o.inSampleSize * 2) >= 800) o.inSampleSize *= 2;
-            Bitmap b = BitmapFactory.decodeFile(dev.getPath(), o);
-            if (b == null) {
-                devView.setVisibility(View.GONE);
-                return false;
-            }
-            int deg = orientation == 6 ? 90 : orientation == 3 ? 180 : orientation == 8 ? 270 : 0;
-            if (deg != 0) {
-                Matrix m = new Matrix();
-                m.postRotate(deg);
-                Bitmap r = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
-                if (r != b) b.recycle();
-                b = r;
-            }
-            devBitmap = b;
-            devView.setImageBitmap(b);
-            devView.setVisibility(View.VISIBLE);
-            return true;
-        } catch (Throwable t) {
-            log("showDevCopy failed: " + t);
-            devView.setVisibility(View.GONE);
-            return false;
-        }
+        if (img == null) playInfo.append("\n(could not show this file)");
     }
 
     /** Photo file name -> film it was shot with, from FILMSIM/SHOTS.TXT. */
@@ -1592,7 +1313,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
 
     public void surfaceCreated(SurfaceHolder holder) {
         surfaceReady = true;
-        if (camera != null) startPreview();
+        if (camera != null && !pausing && (shutdownThread == null || !shutdownThread.isAlive())) startPreview();
     }
 
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
@@ -1602,6 +1323,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     }
 
     private void startPreview() {
+        if (pausing || camera == null) return;
         try {
             camera.getNormalCamera().setPreviewDisplay(surfaceHolder);
             camera.getNormalCamera().startPreview();
@@ -1614,6 +1336,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (pausing || (shutdownThread != null && shutdownThread.isAlive())) return true;
         int scan = event.getScanCode();
         log("down " + scan + " code " + keyCode + " rep " + event.getRepeatCount() + " t " + event.getEventTime() + " menu " + menuOpen);
         if (playback) return onPlaybackKey(scan);
@@ -1627,6 +1350,8 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
                 closeMenu();
                 stopMagnifier();
                 try {
+                    refreshFocusAreas();
+                    if (lastAfStatus == 1 || lastAfStatus == 2) camera.getNormalCamera().cancelAutoFocus();
                     camera.getNormalCamera().autoFocus(null);
                 } catch (Throwable t) {
                     log("autoFocus failed: " + t);
@@ -1709,8 +1434,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
                 }
                 return true;
             case ScalarInput.ISV_KEY_CUSTOM2:
-                if (menuOpen) toggleFavourite();
-                else cycleStrength();
+                cycleStrength();
                 return true;
             case ScalarInput.ISV_KEY_DISP:
                 toggleOverlay();
@@ -1718,7 +1442,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
             case ScalarInput.ISV_KEY_DELETE:
             case ScalarInput.ISV_KEY_SK2:
                 if (menuOpen && menuRow == ROW_FILM) {
-                    selectFilm(null);
+                    selectFilm(library.all().get(0));
                     showMessage("No film");
                 }
                 return true;
@@ -1736,13 +1460,15 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (pausing || (shutdownThread != null && shutdownThread.isAlive())) return true;
         int scan = event.getScanCode();
         log("up " + scan + " code " + keyCode + " t " + event.getEventTime() + " menu " + menuOpen);
         switch (scan) {
             case ScalarInput.ISV_KEY_S1_1:
                 if (camera != null) {
                     try {
-                        camera.getNormalCamera().cancelAutoFocus();
+                        if (lastAfStatus == 1 || lastAfStatus == 2) camera.getNormalCamera().cancelAutoFocus();
+                        focusOverlay.state(0);
                     } catch (Throwable t) {
                         log("cancelAutoFocus failed: " + t);
                     }
@@ -1767,12 +1493,6 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
             showMessage("Wait for the photo to finish saving");
             return;
         }
-        if (developer.pending() > 0 && System.currentTimeMillis() > exitConfirmUntil) {
-            exitConfirmUntil = System.currentTimeMillis() + 3000;
-            showMessage("Still developing a copy. Press MENU again to stop it and exit");
-            return;
-        }
-        developer.cancel();
         try {
             new DAConnectionManager(this).finish();
         } catch (Throwable t) {
@@ -1813,11 +1533,10 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         } else if (movieMode) {
             prefix = "VIDEO (MOVIE to record)    ";
         }
-        if (developing > 0) prefix += "Developing " + developing + "...    ";
         if (film == null) {
             filmBar.setText(prefix + "No film   (Fn: menu)");
         } else {
-            filmBar.setText(prefix + film.brand + "  " + film.name + "   " + stars(film) + "   "
+            filmBar.setText(prefix + film.name + "   "
                     + (bypass ? "OFF (C1)" : strength + "%"));
         }
         filmBar.setTextColor(recording ? 0xFFFF5050 : 0xFFF2C46B);
@@ -1912,20 +1631,16 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         overlay = prefs.getBoolean("overlay", true);
         String filmKey = prefs.getString("film", "");
         film = library == null ? null : library.find(filmKey);
-        pendingFilmKey = film == null && filmKey.startsWith("custom:") ? filmKey : null;
+        if (film == null && library != null && !library.all().isEmpty()) film = library.all().get(0);
         look = null;
         bypass = false;
-        savedWb = prefs.getString("wb", null);
-        halation = prefs.getBoolean("halation", false);
-        grain = Math.max(0, Math.min(GRAIN_NAMES.length - 1, prefs.getInt("grain", 0)));
-        lightLeak = prefs.getBoolean("leak", false);
-        largeCopy = prefs.getBoolean("largecopy", false);
+        savedWb = prefs.getString("wb", "auto");
         dro = Math.max(0, prefs.getInt("dro", 0));
-        favourites.clear();
-        for (String key : prefs.getString("favourites", "").split("\n")) {
-            if (key.length() > 0) favourites.add(key);
-        }
         savedKelvin = prefs.getInt("kelvin", 5500);
+        if (!WB_KELVIN.equals(savedWb) || (savedKelvin != 3200 && savedKelvin != 5500)) {
+            savedWb = "auto";
+            savedKelvin = 5500;
+        }
     }
 
     private void savePrefs() {
@@ -1935,12 +1650,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
                 .putString("film", film == null ? "" : film.file)
                 .putString("wb", savedWb)
                 .putInt("kelvin", savedKelvin)
-                .putBoolean("halation", halation)
-                .putInt("grain", grain)
-                .putBoolean("leak", lightLeak)
-                .putBoolean("largecopy", largeCopy)
                 .putInt("dro", dro)
-                .putString("favourites", joinLines(favourites))
                 .commit();
     }
 
@@ -1965,7 +1675,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
         }
     }
 
-    private void closeLog() {
+    private synchronized void closeLog() {
         if (log == null) return;
         try {
             log.close();
@@ -1975,7 +1685,7 @@ public class FilmSimActivity extends Activity implements SurfaceHolder.Callback,
     }
 
     /** Writes to FILMSIM/LOG.TXT, but never while a photo is being saved. */
-    private void log(String msg) {
+    private synchronized void log(String msg) {
         if (log == null || takingPicture) return;
         try {
             log.write(new SimpleDateFormat("HH:mm:ss").format(new Date()) + " " + msg + "\n");

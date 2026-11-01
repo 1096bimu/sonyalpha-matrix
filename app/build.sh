@@ -9,7 +9,7 @@ SDK=${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}
 BT=$SDK/build-tools/36.0.0
 ANDROID_JAR=$SDK/platforms/android-10/android.jar
 STUBS=${SONY_STUBS:?set SONY_STUBS to the Sony stub jar}
-NAME=FilmSim
+NAME=MatrixTest
 KEYSTORE=debug.keystore
 
 rm -rf build && mkdir -p build/gen build/classes build/dex
@@ -19,7 +19,7 @@ if [ ! -f "$KEYSTORE" ]; then
     -keystore "$KEYSTORE" -storepass android -keypass android -dname "CN=FilmSim Debug"
 fi
 
-"$BT/aapt" package -f -m -J build/gen -M AndroidManifest.xml -S res -I "$ANDROID_JAR"
+"$BT/aapt" package -f -m -J build/gen --custom-package com.filmsim.app -M AndroidManifest.xml -S res -I "$ANDROID_JAR"
 find build/gen src -name '*.java' > build/sources.txt
 javac -source 8 -target 8 -Xlint:-options -nowarn -encoding UTF-8 \
   -bootclasspath "$ANDROID_JAR" -cp "$STUBS" -d build/classes @build/sources.txt
@@ -32,4 +32,4 @@ javac -source 8 -target 8 -Xlint:-options -nowarn -encoding UTF-8 \
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
   --v1-signing-enabled true --v2-signing-enabled false --v3-signing-enabled false \
   --min-sdk-version 10 --out "$NAME.apk" build/aligned.apk
-echo "built $NAME.apk ($(stat -c %s "$NAME.apk") bytes)"
+echo "built $NAME.apk"

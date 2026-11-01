@@ -5,3 +5,7 @@ build/
 *.keystore
 # preview sheets rendered from personal photos
 previews/
+
+vendor/
+
+.DS_Store
