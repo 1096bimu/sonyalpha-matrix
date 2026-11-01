@@ -8,6 +8,21 @@ The camera's own image processor applies a shared 1,024-point tone curve and a
 3×3 RGB matrix. No full-image software grading or second JPEG copy is required.
 RAW sensor data does not have the look baked in.
 
+## Create a camera look
+
+Open **[Alpha Matrix Studio](https://1096bimu.github.io/sonyalpha-matrix/)** to design
+a look in your browser. Drag the six-color hexagon to shape the RGB matrix, adjust
+its two depth controls, and use five slope bars to build a strictly increasing
+tone curve anchored at black and white. Images stay in your browser.
+
+Choose **Export .BIN**, copy the file to **`/MATRIX` at the SD-card root**, and
+reopen **Matrix Test** to select it. The export contains the shared 1,024-point
+tone table and 3×3 matrix in the binary format below. The browser preview uses
+tone → matrix; camera rendering may differ.
+
+The studio is hosted with GitHub Pages from [`docs/`](docs/). It is a static site
+with no build step.
+
 ## Download and install
 
 Download **MatrixTest.apk** from [Releases](https://github.com/1096bimu/sonyalpha-matrix/releases/latest).
