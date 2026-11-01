@@ -50,15 +50,21 @@ Alternatively use [Sony-PMCA-RE](https://github.com/ma1co/Sony-PMCA-RE).
 ## Matrix files
 
 Put files in **`/MATRIX` at the SD-card root**, not inside DCIM. The app creates the
-folder and copies its bundled **CHEN.BIN** there if that filename is absent. Existing
-files are never overwritten. Reopen the app to scan files added to the card.
+folder empty if it is absent. It never copies bundled presets to the card, and
+existing card files are preserved. Reopen the app to scan files added to the card.
 
-The list starts with **No Change**: identity matrix and straight-line tone table.
-A clean card initially has two choices: No Change and CHEN. The last selection and
-strength are remembered. The crazy test look, brands, favourites, .cube imports,
-halation, grain, light leaks and reprocessed-copy playback have been removed.
+The built-in choices are **No Change**, **ETERNAL**, and **NEO**. No Change uses an
+identity matrix and straight-line tone table. ETERNAL and NEO are embedded in the
+APK and available with an empty MATRIX folder. Additional card files follow in
+filename order. The last selection and strength are remembered. The old bundled
+CHEN preset is removed; any CHEN.BIN already on your card remains a user file.
+Brands, favourites, .cube imports, halation, grain, light leaks and reprocessed-copy
+playback are not included.
 
-Use short filenames such as `CHEN-2.BIN` for the camera's SD-card filesystem.
+**BIN filenames must be CAPITAL LETTERS with NO SPACES.** Use uppercase `.BIN`
+and short 8.3-compatible names (up to eight characters before the extension),
+for example `SECOND.BIN`, `ETERNAL.BIN`, or `NEO.BIN`. Use `/MATRIX` in uppercase too.
+Mixed-case or spaced names may be listed but fail to open on Sony's SD filesystem.
 Dotfiles are ignored. The current loader recognizes looks by valid binary contents,
 so camera filename aliases do not need to retain a particular extension. Rejected
 files and scan results are logged in **`FILMSIM/LOG.TXT`**.
@@ -80,11 +86,9 @@ Matrix order is `RR RG RB / GR GG GB / BR BG BB`; quantize each coefficient with
 body-specific hardware limits have not been established. No bias terms are stored.
 The loader requires exactly the specified payload, with no trailing bytes.
 
-The seed CHEN matrix is `[910,53,60,19,891,114,91,22,911]`; its shared curve is
-extracted from the neutral axis of the supplied Dark Melon LUT, interpolated to
-1,024 samples. It does not reproduce that entire 3D LUT. Identity custom gamma does
-not bypass Sony's normal image development. Physical matrix/curve ordering remains
-to be characterized on each body.
+The bundled ETERNAL and NEO files use this same binary format. Identity custom
+gamma does not bypass Sony's normal image development. Physical matrix/curve
+ordering remains to be characterized on each body.
 
 ## Controls
 
